@@ -1,0 +1,719 @@
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
+
+import numpy as np
+
+from config import ControlConfig
+from controller_state import (
+    ArmStatus,
+    ControlCommand,
+    ControlSnapshot,
+    ControllerSnapshot,
+    SettingsTransaction,
+    SettingsTransactionManager,
+    SnapshotStore,
+)
+from filters import JointTargetFilter, PoseFilter, PoseInputLimiter
+from frames import CoordinateFrames, ControllerPose, arm_base_in_horizon, build_coordinate_frames
+from hardware import RealArmBackend
+from ik import NeroIK
+from motion import ArmMotionPlanner, joint_limits, joint_trajectory
+from ros_output import RosOutput
+
+SIDES = ("left", "right")
+
+
+class _StopSignal:
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+
+def _startup_pose(config: ControlConfig, side: str) -> np.ndarray:
+    return np.asarray(getattr(config.startup, f"{side}_pose_rad"), dtype=float).reshape(7)
+
+
+def _controller_snapshot(pose: ControllerPose | None, buttons: int = 0) -> ControllerSnapshot | None:
+    if pose is None:
+        return None
+    return ControllerSnapshot(
+        valid=True,
+        xyz=tuple(float(value) for value in pose.xyz_m),
+        quat=tuple(float(value) for value in pose.quat_xyzw),
+        buttons=int(buttons),
+    )
+
+
+class ArmController:
+    def __init__(
+        self,
+        config: ControlConfig,
+        logger: logging.Logger,
+        pose_source,
+        store: SnapshotStore,
+        arm_factory=None,
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self.pose_source = pose_source
+        self.store = store
+        self.commands: queue.Queue[ControlCommand] = queue.Queue()
+        self.iks = {side: NeroIK(config.ik) for side in SIDES}
+        self.bases = arm_base_in_horizon(config.frames)
+        self.sim_q = {side: np.zeros(7, dtype=float) for side in SIDES}
+        self.real_backends: dict[str, object] = {}
+        self.following: set[str] = set()
+        self.arm_status = {side: ArmStatus() for side in SIDES}
+        self.real_q: dict[str, np.ndarray | None] = {side: None for side in SIDES}
+        self.ros = RosOutput(config.ros_output, logger)
+        self.phase = "STARTUP"
+        self.error: str | None = None
+        self._settings_revision = 0
+        self._settings_error: str | None = None
+        # Owns the whole commit -> persist -> recover span across browser pages,
+        # and gates START while a settings change is in flight or not converged.
+        self.settings_manager = SettingsTransactionManager()
+        self._arm_factory = arm_factory or RealArmBackend
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arm")
+        self._connect_futures: dict[str, Future] = {}
+        self._align_futures: dict[str, Future] = {}
+        self._busy: set[str] = set()
+        self._holds: dict[str, np.ndarray] = {}
+        self._last_hold: dict[str, np.ndarray] = {side: self.sim_q[side].copy() for side in SIDES}
+        self._startup: dict[str, list[np.ndarray]] = {}
+        self._startup_index = 0
+        self._stop_motion = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="arm-controller", daemon=True)
+        self._pose_filters = {}
+        self._limiters = {}
+        self._target_filters = {}
+        self._planners = {}
+        self._hold_states: dict[str, tuple[str, float]] = {}
+        self._joint_limits = joint_limits()
+        self._joint_margin_deg: dict[str, float | None] = {side: None for side in SIDES}
+        self._joint_margin_index: dict[str, int | None] = {side: None for side in SIDES}
+        store.publish(ControlSnapshot())
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, command: ControlCommand) -> None:
+        self.commands.put(command)
+
+    def stop(self) -> None:
+        self._stop_motion.set()
+        self._stop_event.set()
+
+    def wait(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        try:
+            self._begin_startup()
+            period = 1.0 / self.config.motion.command_hz
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                self._poll_futures()
+                self._drain_commands()
+                self._tick()
+                elapsed = time.monotonic() - started
+                self._stop_event.wait(max(0.0, period - elapsed))
+        except Exception as exc:
+            self._fail("controller loop failed", exc)
+        finally:
+            self._shutdown()
+
+    def _tick(self) -> None:
+        self._drop_dead_arms()
+        if self.phase == "STARTUP":
+            self._step_startup()
+            self._hold_following()
+        elif self.phase == "ALIGNING":
+            self._hold_following()
+        elif self.phase == "TELEOP":
+            self._step_teleop()
+        elif self.phase in ("STOPPED", "FAULT"):
+            self._hold_following()
+        self._refresh_feedback()
+        self._publish_ros()
+        self._publish_snapshot()
+
+    # ------------------------------------------------------------------ startup
+    def _begin_startup(self) -> None:
+        if not self.config.startup.enable_startup_pose:
+            self.sim_q = {side: _startup_pose(self.config, side) for side in SIDES}
+            self._finish_startup()
+            return
+        self._startup = {}
+        for side in SIDES:
+            target = _startup_pose(self.config, side)
+            self._startup[side] = joint_trajectory(self.config.motion, self.sim_q[side], target)
+        self._startup_index = 0
+        self.phase = "STARTUP"
+        for side in self.following:
+            self.arm_status[side] = replace(self.arm_status[side], state="READY")
+        self.logger.info("simulation startup motion started")
+
+    def _step_startup(self) -> None:
+        finished = True
+        for side in SIDES:
+            points = self._startup[side]
+            index = min(self._startup_index, len(points) - 1)
+            self.sim_q[side] = points[index].copy()
+            if self._startup_index < len(points) - 1:
+                finished = False
+        self._startup_index += 1
+        if finished:
+            self._finish_startup()
+
+    def _finish_startup(self) -> None:
+        self.logger.info("simulation startup pose reached")
+        if self.real_backends:
+            self._begin_alignment()
+        else:
+            self._enter_teleop()
+
+    # ------------------------------------------------------------------ alignment
+    def _begin_alignment(self) -> None:
+        if not self.real_backends:
+            self._enter_teleop()
+            return
+        self._holds = {}
+        self._align_futures = {}
+        for side in tuple(self.real_backends):
+            backend = self.real_backends[side]
+            self._busy.add(side)
+            self.arm_status[side] = replace(self.arm_status[side], state="ALIGNING", error=None)
+            self._align_futures[side] = self._executor.submit(self._align_worker, side, backend)
+        self.phase = "ALIGNING"
+        self.logger.info("real arm alignment started sides=%s", ",".join(sorted(self.real_backends)))
+
+    def _align_worker(self, side: str, backend) -> np.ndarray:
+        target = _startup_pose(self.config, side)
+        stop = _StopSignal(self._stop_motion, self._stop_event)
+        if not backend.move_j_startup(side, target, stop):
+            raise RuntimeError(f"{side} startup move aborted")
+        hold = backend.prepare_teleop(side, stop)
+        if hold is None:
+            raise RuntimeError(f"{side} servo handoff aborted")
+        return np.asarray(hold, dtype=float).reshape(7)
+
+    def _poll_align(self) -> None:
+        if not self._align_futures:
+            return
+        if self.phase != "ALIGNING":
+            for side in list(self._align_futures):
+                future = self._align_futures[side]
+                if not future.done():
+                    continue
+                del self._align_futures[side]
+                self._busy.discard(side)
+                try:
+                    future.result()
+                except Exception:
+                    pass
+                if side not in self.following:
+                    backend = self.real_backends.pop(side, None)
+                    self.arm_status[side] = replace(self.arm_status[side], state="STOPPED")
+                    if backend is not None:
+                        self._executor.submit(self._close_worker, backend)
+            return
+        for side in list(self._align_futures):
+            future = self._align_futures[side]
+            if not future.done():
+                continue
+            del self._align_futures[side]
+            self._busy.discard(side)
+            try:
+                self._holds[side] = future.result()
+            except Exception as exc:
+                if self._stop_motion.is_set():
+                    self._disconnect_side(side, "STOPPED")
+                else:
+                    self._fail(f"failed to align {side} arm", exc)
+                return
+        if not self._align_futures:
+            self._finish_alignment()
+
+    def _finish_alignment(self) -> None:
+        starts = {side: self.sim_q[side].copy() for side in SIDES}
+        for side, hold in self._holds.items():
+            starts[side] = hold
+            self.sim_q[side] = hold.copy()
+        self.following = set(self._holds)
+        for side in self.following:
+            self.arm_status[side] = replace(self.arm_status[side], state="TELEOP", error=None)
+        self._enter_teleop(starts)
+
+    # ------------------------------------------------------------------ teleop
+    def _reset_motion_state(self, starts: dict[str, np.ndarray]) -> None:
+        """Reset IK/filter/planner anchors so the next target starts from ``starts``.
+
+        Shared by teleop (re)entry and by the live base-remap path, which must
+        drop every stale target/filter residual for the same reason.
+        """
+        for side in SIDES:
+            self.iks[side].reset_state(starts[side])
+        self._pose_filters = {side: PoseFilter(self.config.filters.pose) for side in SIDES}
+        self._limiters = {side: PoseInputLimiter(self.config.input_limit) for side in SIDES}
+        self._target_filters = {
+            side: JointTargetFilter(self.config.filters.ik_output) for side in SIDES
+        }
+        self._planners = {
+            side: ArmMotionPlanner(self.config.motion, starts[side]) for side in SIDES
+        }
+        self._joint_margin_deg = {side: None for side in SIDES}
+        self._joint_margin_index = {side: None for side in SIDES}
+        self._last_hold = {side: starts[side].copy() for side in SIDES}
+
+    def _enter_teleop(self, starts: dict[str, np.ndarray] | None = None) -> None:
+        starts = starts or {side: self.sim_q[side].copy() for side in SIDES}
+        self._reset_motion_state(starts)
+        self.phase = "TELEOP"
+        self.logger.info("teleop started following=%s", ",".join(sorted(self.following)) or "none")
+
+    def _step_teleop(self) -> None:
+        now = time.monotonic()
+        raw = {"left": self.pose_source.get_left(), "right": self.pose_source.get_right()}
+        poses = {}
+        for side in SIDES:
+            pose = self._pose_filters[side].apply(raw[side], now)
+            poses[side] = self._limiters[side].apply(pose, now)
+        frames = build_coordinate_frames(poses["left"], poses["right"], self.config.frames)
+        commands = {}
+        for side in SIDES:
+            target = None
+            reason = None
+            frame = getattr(frames, side)
+            if poses[side] is None:
+                reason = "no PICO pose (tracking lost or frame older than max_pose_age_s)"
+            elif frame is None:
+                reason = "coordinate frame unavailable"
+            else:
+                target = self.iks[side].solve(frame.transform_arm_base_to_flange)
+                if target is None:
+                    reason = "IK found no solution inside the joint limits (target out of workspace)"
+                    self._joint_margin_deg[side] = 0.0
+                else:
+                    lower, upper = self._joint_limits
+                    margins = np.minimum(target - lower, upper - target)
+                    self._joint_margin_index[side] = int(np.argmin(margins))
+                    self._joint_margin_deg[side] = float(np.degrees(margins[self._joint_margin_index[side]]))
+                    target = self._target_filters[side].apply(target, now)
+            self._note_hold(side, reason, now)
+            commands[side] = self._planners[side].step(target, now)
+        for side in self.following:
+            backend = self.real_backends.get(side)
+            if backend is None or side in self._busy:
+                continue
+            backend.update(
+                commands["left"] if side == "left" else None,
+                commands["right"] if side == "right" else None,
+                frames,
+                "",
+                1.0 / self.config.motion.command_hz,
+            )
+        for side in SIDES:
+            self.sim_q[side] = commands[side].copy()
+            self._last_hold[side] = commands[side].copy()
+
+    def _note_hold(self, side: str, reason: str | None, now: float) -> None:
+        """Log why a following arm is holding, instead of freezing silently.
+
+        A missing pose or an unreachable IK target makes the planner hold the
+        last command; without this the arm simply stops and nothing explains it.
+        """
+        if side not in self.following:
+            return
+        last_reason, last_logged = self._hold_states.get(side, (None, 0.0))
+        if reason is None:
+            if last_reason is not None:
+                self.logger.info("teleop target recovered side=%s", side)
+                del self._hold_states[side]
+            return
+        if reason == last_reason and now - last_logged < 5.0:
+            return
+        self.logger.warning("teleop holding %s arm: %s", side, reason)
+        self._hold_states[side] = (reason, now)
+
+    def _hold_following(self) -> None:
+        for side in self.following:
+            backend = self.real_backends.get(side)
+            if backend is None or side in self._busy:
+                continue
+            q = self._last_hold[side]
+            backend.update(
+                q if side == "left" else None,
+                q if side == "right" else None,
+                CoordinateFrames(None, None),
+                "",
+                1.0 / self.config.motion.command_hz,
+            )
+
+    # ------------------------------------------------------------------ commands
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                command = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            self._handle_command(command)
+
+    def _handle_command(self, command: ControlCommand) -> None:
+        # Settings applies answer through their own future even in FAULT/STOPPED,
+        # so the GUI never waits forever for an acknowledgement.
+        if command.kind == "APPLY_SETTINGS":
+            self._apply_settings(command)
+            return
+        if self.phase == "FAULT":
+            return
+        if self.phase == "STOPPED" and command.kind not in ("STOP", "DISCONNECT", "RESET", "CONNECT"):
+            return
+        if command.kind == "DISCONNECT" and (command.side in self._busy or self.phase == "ALIGNING"):
+            return
+        if command.kind == "STOP":
+            self._stop_all()
+        elif command.kind == "RESET":
+            self._reset_stop()
+        elif command.kind == "CONNECT":
+            self._connect(command.side, command.channel)
+        elif command.kind == "DISCONNECT":
+            self._disconnect_side(command.side)
+        elif command.kind == "SET_ROS":
+            self._set_ros(command.enabled)
+
+    def _connect(self, side: str, channel: str) -> None:
+        if side not in SIDES or side in self.real_backends or side in self._busy:
+            return
+        if self.phase in ("ALIGNING", "FAULT"):
+            return
+        channel = channel or self.config.real.channel
+        for other in SIDES:
+            if other == side:
+                continue
+            status = self.arm_status[other]
+            if status.state in ("CONNECTING", "READY", "TELEOP", "ALIGNING", "STOPPED") and status.channel == channel:
+                self.logger.warning("refusing duplicate channel %s", channel)
+                self.arm_status[side] = replace(self.arm_status[side], state="ERROR", error="channel already in use")
+                return
+        self._busy.add(side)
+        self.arm_status[side] = replace(self.arm_status[side], state="CONNECTING", channel=channel, error=None)
+        self._connect_futures[side] = self._executor.submit(self._connect_worker, side, channel)
+
+    def _connect_worker(self, side: str, channel: str):
+        config = replace(self.config.real, channel=channel or self.config.real.channel)
+        return self._arm_factory(side, config, self.config.motion, self.logger)
+
+    def _poll_connect(self) -> None:
+        for side in list(self._connect_futures):
+            future = self._connect_futures[side]
+            if not future.done():
+                continue
+            del self._connect_futures[side]
+            self._busy.discard(side)
+            try:
+                backend = future.result()
+            except Exception as exc:
+                self.arm_status[side] = replace(self.arm_status[side], state="ERROR", error=str(exc))
+                self.logger.warning("failed to connect %s arm: %s", side, exc)
+                continue
+            if self._stop_event.is_set() or self.phase == "FAULT":
+                self._executor.submit(self._close_worker, backend)
+                self.arm_status[side] = replace(self.arm_status[side], state="STOPPED")
+                continue
+            self.real_backends[side] = backend
+            self.arm_status[side] = ArmStatus(
+                state="STOPPED",
+                channel=getattr(backend, "config", self.config.real).channel,
+            )
+            self.logger.info("connected %s arm; STOP latched", side)
+            if self.phase != "STOPPED":
+                self._stop_all(reason=f"{side} arm connected")
+
+    def _disconnect_side(self, side: str, state: str = "SIM") -> None:
+        backend = self.real_backends.pop(side, None)
+        self.following.discard(side)
+        self.real_q[side] = None
+        self._last_hold[side] = self.sim_q[side].copy()
+        self.arm_status[side] = self.arm_status[side].__class__(state=state)
+        if backend is not None:
+            self._executor.submit(self._close_worker, backend)
+        if self.phase == "ALIGNING" and not self.real_backends and not self._stop_motion.is_set():
+            self._enter_teleop()
+
+    def _stop_all(self, reason: str = "requested") -> None:
+        self._stop_motion.set()
+        self.phase = "STOPPED"
+        for side in SIDES:
+            if side in self.real_backends:
+                self.arm_status[side] = replace(self.arm_status[side], state="STOPPED")
+        self.logger.warning("STOP latched: %s; holding all arms", reason)
+
+    def _reset_stop(self) -> None:
+        if self.phase != "STOPPED":
+            return
+        if self._busy or self._align_futures or self._connect_futures:
+            self.logger.warning("STOP reset deferred while a hardware operation is active")
+            return
+        settings_block = self.settings_manager.start_block_reason()
+        if settings_block is not None:
+            # START must not cross an in-flight or unpersisted settings change;
+            # applying again (or waiting) resolves it, so this is recoverable.
+            self._settings_error = settings_block
+            self.logger.warning("%s", settings_block)
+            return
+        self._stop_motion.clear()
+        self.error = None
+        self._settings_error = None
+        for side in self.real_backends:
+            self.arm_status[side] = replace(self.arm_status[side], state="READY")
+        self.logger.warning("start requested; returning simulation and arms to startup")
+        self._begin_startup()
+
+    def _set_ros(self, enabled: bool) -> None:
+        ok = self.ros.set_enabled(enabled)
+        if ok:
+            self.pose_source.send_command("set_ros_output", enabled=enabled)
+        else:
+            self.logger.warning("ROS 2 output unavailable: %s", self.ros.reason)
+
+    # ------------------------------------------------------------------ settings
+    @property
+    def settings_revision(self) -> int:
+        """Revision of the effective configuration (single source for all pages)."""
+        return self._settings_revision
+
+    def _apply_settings(self, command: ControlCommand) -> None:
+        """Commit or reject a settings change atomically inside the control tick.
+
+        A live base-frame change would teleport the IK target of an arm that is
+        currently following, so it is only accepted while nothing is moving.
+        The transaction is also checked for expiry: if the page already timed
+        out and cancelled the request, the control thread must never apply it
+        afterwards. The page's timeout and this commit serialize on the
+        transaction lock, so "page reports timeout while controller commits"
+        cannot desynchronise the views.
+        """
+        transaction = getattr(command, "transaction", None)
+        if transaction is None:
+            # Legacy command without an expiry-aware transaction (e.g. internal
+            # callers or older tests): treat the current revision as the base.
+            transaction = SettingsTransaction(
+                config=command.config,
+                base_revision=self._settings_revision,
+                future=getattr(command, "future", None),
+            )
+        with transaction.lock:
+            if transaction.state != SettingsTransaction.PENDING:
+                if transaction.state == SettingsTransaction.EXPIRED:
+                    reason = "settings rejected: the request expired before it was applied"
+                    self._settings_error = reason
+                    self.logger.warning("%s", reason)
+                    transaction.settle(
+                        SettingsTransaction.REJECTED, reason, self._settings_revision
+                    )
+                return
+            config = transaction.config
+            if config is None:
+                self._reject_settings_locked(
+                    transaction, "settings rejected: no configuration supplied"
+                )
+                return
+            reason = self._settings_reject_reason(transaction.base_revision)
+            if reason is not None:
+                self._reject_settings_locked(transaction, reason)
+                return
+            self.config = config
+            self.bases = arm_base_in_horizon(self.config.frames)
+            self._reset_teleop_state_for_remap()
+            self._settings_revision += 1
+            self._settings_error = None
+            self.logger.info(
+                "settings applied revision=%d power_port_facing left=%s right=%s",
+                self._settings_revision,
+                self.config.frames.power_port_facing_left,
+                self.config.frames.power_port_facing_right,
+            )
+            transaction.settle(SettingsTransaction.ACCEPTED, "", self._settings_revision)
+
+    def _reject_settings_locked(
+        self, transaction: SettingsTransaction, reason: str
+    ) -> None:
+        self._settings_error = reason
+        self.logger.warning("%s", reason)
+        transaction.settle(SettingsTransaction.REJECTED, reason, self._settings_revision)
+
+    def _settings_reject_reason(self, base_revision: int) -> str | None:
+        if base_revision != self._settings_revision:
+            return (
+                "settings rejected: a newer settings revision is active "
+                f"(page revision {base_revision}, controller revision {self._settings_revision}); "
+                "reload the page and re-apply"
+            )
+        if self.phase == "FAULT":
+            return "settings rejected: controller is in FAULT; restart the application"
+        if self.phase == "STARTUP":
+            return "settings rejected: startup motion is running; press STOP first"
+        if self.phase == "ALIGNING":
+            return "settings rejected: real arms are aligning; press STOP first"
+        if self._busy or self._align_futures or self._connect_futures:
+            return "settings rejected: a hardware connect/align operation is in progress"
+        # STOP keeps `following` so the hold stream can keep the servos alive; only
+        # an arm that is actively chasing teleop targets makes a base remap unsafe.
+        if self.phase == "TELEOP" and self.following:
+            return "settings rejected: a real arm is following; press STOP, apply, then Start"
+        if self.phase not in ("TELEOP", "STOPPED"):
+            return f"settings rejected: phase {self.phase} does not accept settings"
+        return None
+
+
+    def _reset_teleop_state_for_remap(self) -> None:
+        """Drop old IK/filter/planner state so a base change cannot push stale targets."""
+        current = {side: self.sim_q[side].copy() for side in SIDES}
+        self._reset_motion_state(current)
+        self._hold_states.clear()
+
+    # ------------------------------------------------------------------ futures
+    def _poll_futures(self) -> None:
+        self._poll_connect()
+        self._poll_align()
+
+    def _close_worker(self, backend) -> None:
+        try:
+            backend.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ telemetry
+    def _drop_dead_arms(self) -> None:
+        """Disconnect arms whose CAN link died, instead of holding a stale pose.
+
+        Suspending the laptop or bouncing can0.service re-registers the netdev;
+        the SDK socket dies and its read thread exits.  Without this check the
+        arm keeps looking connected and simply stops answering, so motion would
+        be commanded into a dead link forever.
+        """
+        for side, backend in list(self.real_backends.items()):
+            if side in self._busy or self.phase == "ALIGNING":
+                continue
+            check = getattr(backend, "transport_error", None)
+            if not callable(check):
+                continue
+            error = check()
+            if error is None:
+                continue
+            self.logger.error("lost %s arm: %s", side, error)
+            del self.real_backends[side]
+            self.following.discard(side)
+            self.real_q[side] = None
+            self._last_hold[side] = self.sim_q[side].copy()
+            self.arm_status[side] = ArmStatus(
+                state="ERROR",
+                channel=getattr(backend, "config", self.config.real).channel,
+                error=error,
+            )
+            self._executor.submit(self._close_worker, backend)
+            self._stop_all(reason=f"{side} arm CAN link lost")
+
+    def _refresh_feedback(self) -> None:
+        for side, backend in self.real_backends.items():
+            if side in self._busy:
+                continue
+            try:
+                backend.refresh_feedback()
+                self.real_q[side] = backend.current_joints(side)
+            except Exception as exc:
+                self.arm_status[side] = replace(self.arm_status[side], error=str(exc))
+
+    def _publish_ros(self) -> None:
+        if not self.ros.enabled:
+            return
+        for side in SIDES:
+            current = self.real_q[side] if side in self.following else self.sim_q[side]
+            target = self.sim_q[side]
+            if current is None:
+                current = target
+            current_pose = self.bases.left @ self.iks[side].fk_flange(current) if side == "left" else self.bases.right @ self.iks[side].fk_flange(current)
+            target_pose = self.bases.left @ self.iks[side].fk_flange(target) if side == "left" else self.bases.right @ self.iks[side].fk_flange(target)
+            self.ros.publish(side, current, target, current_pose, target_pose)
+
+    def _publish_snapshot(self) -> None:
+        buttons = self.pose_source.buttons()
+        controllers = {
+            "left": _controller_snapshot(self.pose_source.get_left(), buttons[0]),
+            "right": _controller_snapshot(self.pose_source.get_right(), buttons[1]),
+        }
+        margin_deg, margin_index = self._tightest_margin()
+        self.store.publish(
+            ControlSnapshot(
+                phase=self.phase,
+                pico=self.pose_source.status(),
+                controllers=controllers,
+                sim_q={side: tuple(self.sim_q[side]) for side in SIDES},
+                real_q={side: (tuple(self.real_q[side]) if self.real_q[side] is not None else None) for side in SIDES},
+                arm_status=dict(self.arm_status),
+                ros={
+                    "available": self.ros.available,
+                    "enabled": self.ros.enabled,
+                    "reason": self.ros.reason,
+                },
+                settings={
+                    "revision": self._settings_revision,
+                    "error": self._settings_error,
+                    "transaction": self.settings_manager.snapshot(),
+                },
+                settings_config=self.config,
+                error=self.error,
+                can_reset=self.phase == "STOPPED"
+                and not self._busy
+                and not self._align_futures
+                and not self._connect_futures
+                and not self.settings_manager.start_blocked(),
+                joint_margin_deg=margin_deg,
+                joint_margin_index=margin_index,
+            )
+        )
+
+    def _tightest_margin(self) -> tuple[float | None, int | None]:
+        """Smallest joint-limit margin of the targeted pose, across active arms."""
+        sides = self.following or SIDES
+        best_value = None
+        best_index = None
+        for side in sides:
+            value = self._joint_margin_deg[side]
+            if value is None:
+                continue
+            if best_value is None or value < best_value:
+                best_value = value
+                best_index = self._joint_margin_index[side]
+        return best_value, best_index
+
+    # ------------------------------------------------------------------ failure
+    def _fail(self, message: str, exc: Exception) -> None:
+        self.logger.exception("%s: %s", message, exc)
+        self.error = f"{message}: {exc}"
+        self.phase = "FAULT"
+        self._stop_motion.set()
+        self._publish_snapshot()
+        for side, backend in list(self.real_backends.items()):
+            if side not in self.following:
+                self.real_backends.pop(side, None)
+                self.arm_status[side] = replace(self.arm_status[side], state="ERROR", error=str(exc))
+                self._close_worker(backend)
+
+    def _shutdown(self) -> None:
+        self._stop_event.set()
+        self._executor.shutdown(wait=False)
+        for backend in list(self.real_backends.values()):
+            self._close_worker(backend)
+        self.real_backends.clear()
+        self.ros.close()

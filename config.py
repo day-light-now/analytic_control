@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from mounting import FRONT_RPY_DEG
+
+
+def default_can_interface() -> str:
+    """CAN backend used by the Nero SDK on this platform."""
+    return "agx_cando" if os.name == "nt" else "socketcan"
+
+
+def default_can_channels() -> tuple[str, str]:
+    """Default (left, right) channels: adapter indices on Windows, canX elsewhere."""
+    return ("0", "1") if os.name == "nt" else ("can0", "can1")
+
+
+@dataclass(frozen=True)
+class PoseInputConfig:
+    max_pose_age_s: float = 0.25
+    disconnect_s: float = 0.5
+
+
+@dataclass(frozen=True)
+class PicoConfig:
+    device_port: int = 29761
+    ingest_host: str = "127.0.0.1"
+    vr_port: int = 9100
+    ipc_host: str = "127.0.0.1"
+    ipc_port: int = 9101
+    package: str = "com.mmhand.pico_head_relative_pose"
+    adb_path: str = ""
+    adb_retry_s: float = 3.0
+    status_hz: float = 2.0
+    focus_guard: bool = True
+    focus_guard_interval_s: float = 0.5
+    focus_guard_min_interval_s: float = 2.0
+    overlay_package: str = "com.picovr.systemext"
+
+
+@dataclass(frozen=True)
+class IpcConfig:
+    host: str = "127.0.0.1"
+    port: int = 9101
+    max_line_bytes: int = 65536
+    reconnect_min_s: float = 0.5
+    reconnect_max_s: float = 2.0
+
+
+@dataclass(frozen=True)
+class GuiConfig:
+    host: str = "127.0.0.1"
+    port: int = 8080
+    port_span: int = 50
+    refresh_hz: float = 30.0
+
+
+@dataclass(frozen=True)
+class RosOutputConfig:
+    prefix: str = "/nero"
+    frame_id: str = "pose_input_horizon"
+
+
+@dataclass(frozen=True)
+class FrameTransformConfig:
+    translation_left_shoulder_to_left_arm_base_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Defaults are the original model installation ("Front"); mounting.py owns
+    # the preset constants so Front cannot drift as a hand-written duplicate.
+    rotation_left_shoulder_to_left_arm_base_rpy_deg: tuple[float, float, float] = FRONT_RPY_DEG["left"]
+    translation_right_shoulder_to_right_arm_base_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rotation_right_shoulder_to_right_arm_base_rpy_deg: tuple[float, float, float] = FRONT_RPY_DEG["right"]
+    # Power-port facing preset per arm: "front" (original model), "down"
+    # (physical installation facing the ground) or "custom" (manual RPY).
+    power_port_facing_left: str = "front"
+    power_port_facing_right: str = "front"
+    translation_horizon_to_left_shoulder_m: tuple[float, float, float] = (-0.16, 0.0, 0.0)
+    translation_horizon_to_right_shoulder_m: tuple[float, float, float] = (0.16, 0.0, 0.0)
+    translation_controller_to_flange_m: tuple[float, float, float] = (0.0, -0.03, 0.065)
+    rotation_controller_to_flange_rpy_deg: tuple[float, float, float] = (0.0, -180.0, 90.0)
+    human_size_m: float = 1.0
+    robot_size_m: float = 1.45
+
+
+@dataclass(frozen=True)
+class IkConfig:
+    n_psi: int = 181
+    local_theta0_window: float = 0.7
+    local_theta0_count: int = 50
+    w_vel: float = 0.0
+    w_acc: float = 0.0
+    w_pose: float = 0.7
+    w_theta0: float = 0.1
+    w_limit: float = 0.4
+    branch_switch_max_joint_delta_rad: float = 0.2
+    branch_switch_min_improvement: float = 0.5
+    reach_max_ratio: float = 0.95
+    reach_min_ratio: float = 1.05
+    enable_initial_global_search: bool = True
+    enable_global_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class OneEuroConfig:
+    enabled: bool = True
+    min_cutoff: float = 3
+    beta: float = 0.05
+    d_cutoff: float = 1.0
+
+
+@dataclass(frozen=True)
+class InputLimiterConfig:
+    enabled: bool = True
+    max_linear_speed_m_s: float = 2.0
+    max_angular_speed_rad_s: float = 4.0
+    max_position_step_m: float = 0.04
+    max_rotation_step_rad: float = 0.16
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    pose: OneEuroConfig = field(default_factory=OneEuroConfig)
+    ik_output: OneEuroConfig = field(default_factory=OneEuroConfig)
+
+
+@dataclass(frozen=True)
+class StartupConfig:
+    # The right pose is the mirror image of the left one across the sagittal
+    # plane, mapped onto the right arm's base frame:
+    #   right = (-j1, j2, -j3, j4, -j5 - pi, j6, -j7)
+    # This matches R_right = mirror(R_left) @ Rx(pi) from the base frames below,
+    # so both arms are exactly mirror-symmetric in the horizon frame.
+    left_pose_rad: tuple[float, ...] = (-0.045583485, 1.0471975511965976, 0.182135811, 1.005800624, -1.0471975511965976, -0.495527784, 0.0)
+    right_pose_rad: tuple[float, ...] = (0.045583485, 1.0471975511965976, -0.182135811, 1.005800624, -2.0943951023931953, -0.495527784, 0.0)
+    enable_startup_pose: bool = True
+
+
+@dataclass(frozen=True)
+class MotionConfig:
+    command_hz: float = 50.0
+    max_joint_step_rad: float = 0.03
+    max_velocity_rad_s: tuple[float, ...] = (0.4, 0.4, 0.4, 0.4, 0.5, 0.5, 0.5)
+    max_acceleration_rad_s2: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    max_trajectory_duration_s: float = 20.0
+    joint_limit_margin_rad: float = 0.035
+
+
+@dataclass(frozen=True)
+class RealArmConfig:
+    sdk_path: str = "third_party/pyAgxArm"
+    interface: str = "socketcan"
+    channel: str = "can0"
+    bitrate: int = 1_000_000
+    firmware: str = "auto"
+    speed_percent: int = 20
+    startup_timeout_s: float = 3.0
+    enable_timeout_s: float = 5.0
+    can_fault_grace_s: float = 3.0
+    can_send_timeout_s: float = 0.05
+    can_frame_interval_s: float = 0.005
+    servo_handoff_s: float = 0.2
+    feedback_stale_s: float = 0.25
+    sdk_joint_limits_enabled: bool = False
+
+    @classmethod
+    def for_platform(cls) -> "RealArmConfig":
+        """Real-arm settings for this host: SocketCAN on Linux, agx_cando on Windows."""
+        return cls(interface=default_can_interface(), channel=default_can_channels()[0])
+
+
+@dataclass(frozen=True)
+class LogConfig:
+    enabled: bool = True
+    directory: str = "logs"
+    max_bytes: int = 2_000_000
+    backup_count: int = 3
+
+
+@dataclass(frozen=True)
+class ControlConfig:
+    pose_input: PoseInputConfig = field(default_factory=PoseInputConfig)
+    pico: PicoConfig = field(default_factory=PicoConfig)
+    ipc: IpcConfig = field(default_factory=IpcConfig)
+    gui: GuiConfig = field(default_factory=GuiConfig)
+    ros_output: RosOutputConfig = field(default_factory=RosOutputConfig)
+    frames: FrameTransformConfig = field(default_factory=FrameTransformConfig)
+    ik: IkConfig = field(default_factory=IkConfig)
+    input_limit: InputLimiterConfig = field(default_factory=InputLimiterConfig)
+    filters: FilterConfig = field(default_factory=FilterConfig)
+    startup: StartupConfig = field(default_factory=StartupConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
+    real: RealArmConfig = field(default_factory=RealArmConfig.for_platform)
+    log: LogConfig = field(default_factory=LogConfig)
