@@ -129,8 +129,12 @@ The cards show pose, quaternion, yaw/pitch/roll, and tracking state. The buttons
 ### Settings
 
 - **Front** means the power port faces the horizon-forward direction; **Down** means it faces gravity. The magenta marker shows the selected direction.
+- For a port facing **Back** or **Up**, choose **Custom** and enter the matrix-derived angles below. Check the magenta marker and the real port before Connect/Start.
+- Back: left `(180, 90, 0)`, right `(0, 90, 0)`.
+- Up: left `(90, 0, -90)`, right `(-90, 0, -90)`.
+- These values are derived from the mounting matrix, not a measured calibration. If the marker does not match the physical port, stop and use measured values instead.
 - Keep Startup Pose and Base Frames at their shipped defaults for a first installation; edit them only after checking the real arm.
-- The shipped defaults are the original model's Front installation. Use **Custom** only with values measured from the actual arm.
+- The shipped defaults are the original model's Front installation.
 
 ![Mounting direction reference](docs/screenshots/orientation_diagram.png)
 
