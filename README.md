@@ -13,6 +13,15 @@ Requirements:
 
 ### Install
 
+On a new host, install the system packages first:
+
+```bash
+sudo apt update
+sudo apt install -y git build-essential python3.12-dev python3.12-venv adb usbutils can-utils libusb-1.0-0
+```
+
+Then install the Python environment and build the IK extension:
+
 ```bash
 cd <project-dir>
 python3.12 -m venv .venv
@@ -64,6 +73,8 @@ The screenshots below are from pure simulation.
 ![Main window](docs/screenshots/ui_01_arm_simulation_annotated.png)
 
 1 Connect Arms · 2 ROS 2 Output · 3 STOP · 4 pages · 5 status · 6 legend · 7 System Log.
+
+Blue and orange are the target models; the green ghost is real-arm feedback; the magenta marker shows the mounting reference. The System Log shows connection, settings, and feedback messages.
 
 - **Connect Arms** opens the channel dialog.
 - **Connect / Disconnect** in that dialog connects and enables, or releases, the selected side.
