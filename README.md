@@ -77,7 +77,6 @@ The screenshots below are from pure simulation.
 Blue and orange are the target models; the green ghost is real-arm feedback; the magenta marker shows the mounting reference. The System Log shows connection, settings, and feedback messages.
 
 - **Connect Arms** opens the channel dialog.
-- **Connect / Disconnect** in that dialog connects and enables, or releases, the selected side.
 - **Start** is available in STOPPED once settings are saved. It moves connected arms to the Startup Pose before following; using Start again after STOP repeats this sequence.
 - **STOP** stops advancing new targets and holds the arm. It is not a physical emergency stop.
 - **ROS 2 Output** is an optional switch; leave it off unless you need ROS topics.
@@ -97,14 +96,14 @@ The three pages are **Arm Simulation** for the 3D target and feedback model, **C
 
 - **Apply** validates, applies, and saves the settings. It is disabled while a transaction is in progress and rejected while a real arm is following; press STOP first.
 - **Restore Defaults** removes the saved settings and restores defaults.
-- **Cancel** and **Start** in the Start dialog cancel or begin the startup and alignment sequence.
+- **Cancel** in the Start dialog closes it without starting.
 
 ![Start dialog](docs/screenshots/ui_05_start_dialog.png)
 
 ### Settings
 
 - **Power Port Facing**: choose **Front** when the power port faces the horizon-forward direction, or **Down** when it faces gravity. The magenta marker shows the selected direction.
-- **Startup Pose**: keep the defaults for a first installation; edit the seven joint angles only after checking the real arm.
+- **Startup Pose**: keep the defaults for a first installation; edit the seven joint angles (degrees) only after checking the real arm.
 - Keep the other Base Frames values at their defaults unless the arm has been measured.
 - The shipped defaults are the original model's Front installation. Use **Custom** only with values measured from the actual arm.
 
